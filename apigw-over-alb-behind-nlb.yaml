@@ -418,11 +418,6 @@ Resources:
       HealthCheckPath: /prod/healthcheck
       Matcher:
         HttpCode: '200,403'
-      TargetGroupAttributes:
-        - Key: deregistration_delay.connection_termination.enabled
-          Value: 'true'
-        - Key: deregistration_delay.timeout_seconds
-          Value: '300'
       Targets:
         - Id: !Ref ApplicationLoadBalancer
           Port: 443

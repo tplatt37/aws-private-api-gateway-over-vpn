@@ -10,9 +10,13 @@ To have a static, un-changing internal IP address for this, we're going to stick
 
 We'll also setup a Client VPN connection, so we can demonstrate accessing this over a VPN connection (using the internal IP of the NLB)
 
+It's going to look like:
+
+![API Gw behind ALB and NLB](docs/API%20GW%20via%20NLB%20AWS%20Client%20VPN.drawio.png)
+
 ## Pre-Requisites
 
-* Route 53 Hosted Zone (Public)
+* Route 53 Hosted Zone (Public) - Somehow you need name resolution.  For demonstration purposes this is easiest, but what is actually required will depend on how your VPN connectivity is actually configured.
 
 ## AWS Client VPN Setup
 
@@ -42,25 +46,24 @@ curl https://whateverdomainyouused.com/prod/data
 
 This should return a JSON output when connected to VPN, and the name will be unresolvable / unreachable if not connected to VPN
 
-NOTE: Health checks seem to fail with a 403.  Probably because the Host Header isn't what is expected.  This will cause both Target Group entries to be Unhealthy , but the ALB will "Fail Open" such that one of the endpoints will be available.  You can simply redefine success to be a 403 and then they will be healthy.  Because the Target Group is interface endpoints, we don't really want to use the Health Checks.
-
 ## VPN Cleanup
 
-1. Delete the ALB stack(s)
+1. Delete the ALB/NLB/API Gw stack
 2. Delete the VPN stack
 3. Manually delete the ACM certs that were imported during VPN setup.
 4. OPTIONAL: Delete the certificate files created for VPN 
 
 
-# API Gateway Private REST API over ALB
+# API Gateway Private REST API over ALB behind NLB
 
+The NLB gives us STATIC, un-changing INTERNAL IPs.
 
-This will leverage the HostHeader rewrite capability of the ALB.
+The ALB will rewrite the HostHeader so the API Gateway service makes the connection to the Private REST API to be used.
+
 
 Simply create the stack using apigw-over-alb-behind-nlb.yaml
 
-Create a HOSTS entry to point yourcustomdomainname.com to the static IPs of the NLB.
-
+Create a HOSTS entry to point yourcustomdomainname.com to a static IP of the NLB. OR just use the public hosted record (Not for production).
 
 
 ... and then curl (while connected to VPN, of course) :
