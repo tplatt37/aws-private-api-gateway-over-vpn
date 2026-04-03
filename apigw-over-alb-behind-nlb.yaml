@@ -1,0 +1,529 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Private API Gateway REST API over VPN: an internal Network Load Balancer
+  uses fixed private listener addresses (PrivateIPv4Address per subnet) and
+  forwards TCP/443 to an internal Application Load Balancer, which terminates
+  TLS and host-rewrites to the execute-api interface endpoint ENIs. Route 53
+  aliases the custom domain to the NLB.
+
+# ===========================================================================
+# Parameters
+# ===========================================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID to deploy resources into
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: VPC CIDR (must match VPN stack) — used for ALB/NLB security groups
+
+  ClientVpnCidr:
+    Type: String
+    Default: '10.1.0.0/16'
+    Description: >-
+      Client VPN CIDR (must match VPN stack ClientVpnCidr). ALB sees real
+      client IPs (NLB preserves client IP when the target is an ALB).
+
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet for VPC endpoint, ALB, and NLB (AZ 1)
+
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet for VPC endpoint, ALB, and NLB (AZ 2)
+
+  NlbPrivateIpAz1:
+    Type: String
+    Default: '10.0.2.20'
+    AllowedPattern: ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$
+    Description: >-
+      Static private IPv4 for the NLB in SubnetId1 (must lie inside that
+      subnet CIDR, unused). Default matches vpn/vpn.yaml private subnet 1
+      (10.0.2.0/24).
+
+  NlbPrivateIpAz2:
+    Type: String
+    Default: '10.0.3.20'
+    AllowedPattern: ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$
+    Description: >-
+      Static private IPv4 for the NLB in SubnetId2 (must lie inside that
+      subnet CIDR, unused). Default matches vpn/vpn.yaml private subnet 2
+      (10.0.3.0/24).
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone ID for DNS record creation
+
+  DomainName:
+    Type: String
+    Description: Custom domain name for HTTPS (e.g., api.example.com)
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$
+
+# ===========================================================================
+# Resources
+# ===========================================================================
+Resources:
+
+  # -------------------------------------------------------------------------
+  # Security Groups
+  # -------------------------------------------------------------------------
+  NLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS to internal NLB from VPC and VPN clients
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC (includes AZ subnets where NLB ENIs live)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientVpnCidr
+          Description: HTTPS from VPN clients
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nlb-sg'
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS to ALB from VPC and VPN clients (client IP preserved)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC (NLB health checks and east-west)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientVpnCidr
+          Description: HTTPS from VPN clients
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from ALB to VPC Endpoint ENIs
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpce-sg'
+
+  # -------------------------------------------------------------------------
+  # API Gateway Interface VPC Endpoint (execute-api)
+  # -------------------------------------------------------------------------
+  ApiGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.execute-api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # -------------------------------------------------------------------------
+  # Lambda Custom Resource – Resolve ENI IDs to Private IPs
+  # -------------------------------------------------------------------------
+  ENIResolverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribeENIs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+
+  ENIResolverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-eni-ip-resolver'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt ENIResolverRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      eni_ids = event['ResourceProperties']['NetworkInterfaceIds']
+                      ec2 = boto3.client('ec2')
+                      resp = ec2.describe_network_interfaces(NetworkInterfaceIds=eni_ids)
+                      ips = [eni['PrivateIpAddress'] for eni in resp['NetworkInterfaces']]
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'IP1': ips[0],
+                          'IP2': ips[1] if len(ips) > 1 else ips[0],
+                          'IPs': ','.join(ips)
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  ENIIPLookup:
+    Type: Custom::ENIIPLookup
+    Properties:
+      ServiceToken: !GetAtt ENIResolverFunction.Arn
+      NetworkInterfaceIds: !GetAtt ApiGatewayEndpoint.NetworkInterfaceIds
+
+  # -------------------------------------------------------------------------
+  # API Gateway – Private REST API
+  # -------------------------------------------------------------------------
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-private-api'
+      Description: Private REST API accessible only via VPC Endpoint
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+        VpcEndpointIds:
+          - !Ref ApiGatewayEndpoint
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+            Condition:
+              StringNotEquals:
+                aws:sourceVpce: !Ref ApiGatewayEndpoint
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+
+  # /healthcheck resource
+  HealthcheckResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: healthcheck
+
+  HealthcheckMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref HealthcheckResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: '{"status": "healthy"}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+
+  # /data resource
+  DataResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: data
+
+  DataMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DataResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: '{"message": "Hello from Private API Gateway", "source": "mock-integration"}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+
+  # Deployment and Stage
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HealthcheckMethod
+      - DataMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  # -------------------------------------------------------------------------
+  # ACM Certificate (DNS Validation via Route 53)
+  # -------------------------------------------------------------------------
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  # -------------------------------------------------------------------------
+  # Application Load Balancer (internal — TLS termination + host rewrite)
+  # -------------------------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  # -------------------------------------------------------------------------
+  # Target Group – IP-based, HTTPS to VPC Endpoint ENIs
+  # -------------------------------------------------------------------------
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-api-tg'
+      VpcId: !Ref VpcId
+      Protocol: HTTPS
+      Port: 443
+      TargetType: ip
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: '443'
+      HealthCheckPath: /prod/healthcheck
+      Matcher:
+        HttpCode: '200,403' # A 403 is OK, it means we reached the service
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'false'
+      Targets:
+        - Id: !GetAtt ENIIPLookup.IP1
+          Port: 443
+        - Id: !GetAtt ENIIPLookup.IP2
+          Port: 443
+
+  # -------------------------------------------------------------------------
+  # HTTPS Listener
+  # -------------------------------------------------------------------------
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # -------------------------------------------------------------------------
+  # Listener Rule – Forward with Host Header Rewrite (Transform)
+  # -------------------------------------------------------------------------
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 1
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref DomainName
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+      Transforms:
+        - Type: host-header-rewrite
+          HostHeaderRewriteConfig:
+            Rewrites:
+              - Regex: '^(.*)$'
+                Replace: !Sub '${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com'
+
+  # -------------------------------------------------------------------------
+  # Target Group — NLB → ALB (TCP passthrough preserves HTTPS to ALB)
+  # -------------------------------------------------------------------------
+  NlbToAlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+      - ALBListener
+      - ALBListenerRule
+    Properties:
+      Name: !Sub '${AWS::StackName}-nlb-alb'
+      VpcId: !Ref VpcId
+      TargetType: alb
+      Protocol: TCP
+      Port: 443
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: '443'
+      HealthCheckPath: /prod/healthcheck
+      Matcher:
+        HttpCode: '200,403'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.connection_termination.enabled
+          Value: 'true'
+        - Key: deregistration_delay.timeout_seconds
+          Value: '300'
+      Targets:
+        - Id: !Ref ApplicationLoadBalancer
+          Port: 443
+
+  # -------------------------------------------------------------------------
+  # Network Load Balancer (internal — fixed private listener IP per AZ)
+  # -------------------------------------------------------------------------
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-nlb'
+      Type: network
+      Scheme: internal
+      IpAddressType: ipv4
+      SubnetMappings:
+        - SubnetId: !Ref SubnetId1
+          PrivateIPv4Address: !Ref NlbPrivateIpAz1
+        - SubnetId: !Ref SubnetId2
+          PrivateIPv4Address: !Ref NlbPrivateIpAz2
+      SecurityGroups:
+        - !Ref NLBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nlb'
+
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 443
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NlbToAlbTargetGroup
+
+  # -------------------------------------------------------------------------
+  # Route 53 — alias to NLB (custom domain resolves to NLB private addresses)
+  # -------------------------------------------------------------------------
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: NLBListener
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt NetworkLoadBalancer.DNSName
+        HostedZoneId: !GetAtt NetworkLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
+Outputs:
+  ApiGatewayId:
+    Description: API Gateway REST API ID
+    Value: !Ref ApiGateway
+
+  ApiGatewayUrl:
+    Description: API Gateway invoke URL (via VPC Endpoint)
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  NLBDNSName:
+    Description: Internal NLB DNS name (resolves to private IPs in the VPC)
+    Value: !GetAtt NetworkLoadBalancer.DNSName
+
+  NLBPrivateIpAz1:
+    Description: Configured static private IP for NLB in subnet 1 (AZ 1)
+    Value: !Ref NlbPrivateIpAz1
+
+  NLBPrivateIpAz2:
+    Description: Configured static private IP for NLB in subnet 2 (AZ 2)
+    Value: !Ref NlbPrivateIpAz2
+
+  ALBDNSName:
+    Description: Internal ALB DNS name (behind NLB)
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  CustomDomainURL:
+    Description: Custom domain URL (Route 53 points to NLB)
+    Value: !Sub 'https://${DomainName}/prod'
+
+  HealthcheckURL:
+    Description: Healthcheck endpoint via custom domain
+    Value: !Sub 'https://${DomainName}/prod/healthcheck'
+
+  DataURL:
+    Description: Data endpoint via custom domain
+    Value: !Sub 'https://${DomainName}/prod/data'
+
+  VPCEndpointId:
+    Description: API Gateway Interface VPC Endpoint ID
+    Value: !Ref ApiGatewayEndpoint
+
+  TargetIP1:
+    Description: First VPC Endpoint ENI private IP
+    Value: !GetAtt ENIIPLookup.IP1
+
+  TargetIP2:
+    Description: Second VPC Endpoint ENI private IP
+    Value: !GetAtt ENIIPLookup.IP2

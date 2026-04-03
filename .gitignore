@@ -1,0 +1,6 @@
+.DS_Store
+client-config.ovpn
+vpn/client-config.ovpn
+*.drawio.bkp
+node_modules
+.env

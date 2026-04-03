@@ -1,0 +1,660 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VPC with two public subnets, two private subnets, an AWS Client VPN
+  endpoint targeting both private subnets, a free S3 Gateway Endpoint,
+  and Interface Endpoints (PrivateLink) for: S3, API Gateway, and AppSync.
+  A NAT Gateway in the first public subnet provides Internet access for the private subnets.
+  There is also an EC2 Jumpbox (WITH ADMIN ACCESS!) in the private subnet - 
+  connect using SSM Session Manager
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the VPC.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: CIDR block for the public subnet (AZ 1).
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.5.0/24'
+    Description: CIDR block for the second public subnet (AZ 2).
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: CIDR block for the private subnet (AZ 1).
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.3.0/24'
+    Description: CIDR block for the second private subnet (AZ 2).
+
+  ClientVpnCidr:
+    Type: String
+    Default: '10.1.0.0/16'
+    Description: >-
+      IP range assigned to VPN clients. Must NOT overlap the VPC CIDR
+      or any associated subnet.
+
+  ServerCertificateArn:
+    Type: String
+    Description: ARN of the server TLS certificate imported into ACM.
+
+  ClientCertificateArn:
+    Type: String
+    Description: >-
+      ARN of the client root CA certificate imported into ACM.
+      For mutual auth, may be the same ARN as the server cert if both
+      were issued by the same CA.
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # VPC
+  # ----------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  # ----------------------------------------------------------
+  # Internet Gateway
+  # ----------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ----------------------------------------------------------
+  # Public Subnet + Route Table
+  # ----------------------------------------------------------
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ----------------------------------------------------------
+  # Second Public Subnet
+  # Placed in a different AZ from the first public subnet.
+  # Shares the same Public Route Table (same IGW default route).
+  # ----------------------------------------------------------
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-2'
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ----------------------------------------------------------
+  # NAT Gateway — provides Internet access for private subnets
+  # ----------------------------------------------------------
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-gw'
+
+  # ----------------------------------------------------------
+  # Private Subnet + Route Table
+  # ----------------------------------------------------------
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ----------------------------------------------------------
+  # Second Private Subnet + Route Table (required for ALB)
+  # Placed in a different AZ from the first private subnet.
+  # ----------------------------------------------------------
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-2'
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ----------------------------------------------------------
+  # S3 Gateway Endpoint — FREE
+  # Required by AWS before an S3 Interface Endpoint can enable
+  # private DNS. Also handles all in-VPC S3 traffic at no cost.
+  # NOTE: Tags are NOT supported on Gateway-type endpoints —
+  # omitting them here avoids the cfn-lint / API validation error.
+  # ----------------------------------------------------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
+        - !Ref PrivateRouteTable2
+
+  # ----------------------------------------------------------
+  # Security Group — S3 Interface Endpoint
+  # ----------------------------------------------------------
+  S3EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS to S3 Interface Endpoint from VPC and VPN clients
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC resources
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientVpnCidr
+          Description: HTTPS from VPN clients
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-s3-endpoint-sg'
+
+  # ----------------------------------------------------------
+  # S3 Interface Endpoint (PrivateLink)
+  # DependsOn the Gateway Endpoint — AWS requires it to exist
+  # first before PrivateDnsEnabled can be set to true.
+  # ----------------------------------------------------------
+  S3InterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn: S3GatewayEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref S3EndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ----------------------------------------------------------
+  # Security Group — AppSync Interface Endpoint
+  # ----------------------------------------------------------
+  AppSyncEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS to AppSync Interface Endpoint from VPC and VPN clients
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC resources
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientVpnCidr
+          Description: HTTPS from VPN clients
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-appsync-endpoint-sg'
+
+  # ----------------------------------------------------------
+  # AppSync Interface Endpoint (PrivateLink)
+  # ----------------------------------------------------------
+  AppSyncInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.appsync-api'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref AppSyncEndpointSecurityGroup
+      # IMPORTANT!
+      # We want to be able to resolve the domain name of the graphql endpoint to the internal IP.
+      PrivateDnsEnabled: true
+
+  # ----------------------------------------------------------
+  # Security Group — SSM Interface Endpoints
+  # Shared by ssm, ssmmessages, and ec2messages endpoints.
+  # ----------------------------------------------------------
+  SsmEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS to SSM Interface Endpoints from VPC and VPN clients
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC resources
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientVpnCidr
+          Description: HTTPS from VPN clients
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ssm-endpoint-sg'
+
+  # ----------------------------------------------------------
+  # SSM Interface Endpoint
+  # Required for Session Manager connectivity.
+  # ----------------------------------------------------------
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SsmEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ----------------------------------------------------------
+  # SSM Messages Interface Endpoint
+  # Required for Session Manager connectivity.
+  # ----------------------------------------------------------
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SsmEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ----------------------------------------------------------
+  # EC2 Messages Interface Endpoint
+  # Required for Session Manager connectivity.
+  # ----------------------------------------------------------
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SsmEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # ----------------------------------------------------------
+  # IAM Role — Jumpbox EC2 instance
+  # Grants SSM Session Manager access and full admin capability.
+  # ----------------------------------------------------------
+  JumpboxRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-jumpbox-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-jumpbox-role'
+
+  # ----------------------------------------------------------
+  # Instance Profile — wraps the Jumpbox IAM Role
+  # ----------------------------------------------------------
+  JumpboxInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-jumpbox-profile'
+      Roles:
+        - !Ref JumpboxRole
+
+  # ----------------------------------------------------------
+  # Security Group — Jumpbox EC2 instance
+  # No inbound rules needed; SSM Session Manager uses outbound
+  # HTTPS to the SSM endpoints above.
+  # ----------------------------------------------------------
+  JumpboxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Jumpbox EC2 instance - outbound-only (Session Manager via SSM endpoints)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-jumpbox-sg'
+
+  # ----------------------------------------------------------
+  # Jumpbox EC2 Instance (t2.micro, Amazon Linux 2023)
+  # Access via Systems Manager Session Manager only.
+  # AMI resolved from SSM public parameter store at deploy time.
+  # ----------------------------------------------------------
+  JumpboxInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref PrivateSubnet
+      IamInstanceProfile: !Ref JumpboxInstanceProfile
+      SecurityGroupIds:
+        - !Ref JumpboxSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-jumpbox'
+
+  # ----------------------------------------------------------
+  # Security Group — Client VPN Endpoint
+  # ----------------------------------------------------------
+  ClientVpnSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Controls traffic to/from the Client VPN endpoint
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: Allow inbound VPN client connections
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cvpn-sg'
+
+  # ----------------------------------------------------------
+  # CloudWatch Log Group / Stream for VPN connection logs
+  # ----------------------------------------------------------
+  VpnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/clientvpn/${AWS::StackName}'
+      RetentionInDays: 30
+
+  VpnLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref VpnLogGroup
+      LogStreamName: connections
+
+  # ----------------------------------------------------------
+  # Client VPN Endpoint
+  # ----------------------------------------------------------
+  ClientVpnEndpoint:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Properties:
+      Description: !Sub '${AWS::StackName} - private subnet access'
+      ClientCidrBlock: !Ref ClientVpnCidr
+      ServerCertificateArn: !Ref ServerCertificateArn
+      AuthenticationOptions:
+        - Type: certificate-authentication
+          MutualAuthentication:
+            ClientRootCertificateChainArn: !Ref ClientCertificateArn
+      ConnectionLogOptions:
+        Enabled: true
+        CloudwatchLogGroup: !Ref VpnLogGroup
+        CloudwatchLogStream: !Ref VpnLogStream
+      SecurityGroupIds:
+        - !Ref ClientVpnSecurityGroup
+      VpcId: !Ref VPC
+      # You probably want SplitTunnel enabled, so that Internet requests don't get routed through AWS VPN
+      # That would result in additional Data Transfer Out fees
+      SplitTunnel: true
+      TransportProtocol: udp
+      VpnPort: 443
+
+  # ----------------------------------------------------------
+  # Associate the VPN endpoint with BOTH private subnets
+  # ----------------------------------------------------------
+  ClientVpnAssociation:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      SubnetId: !Ref PrivateSubnet
+
+  ClientVpnAssociation2:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      SubnetId: !Ref PrivateSubnet2
+
+  # ----------------------------------------------------------
+  # Authorization Rules — all VPN clients → both private subnets
+  # ----------------------------------------------------------
+  ClientVpnAuthRule:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    DependsOn: ClientVpnAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      TargetNetworkCidr: !Ref PrivateSubnetCidr
+      AuthorizeAllGroups: true
+      Description: Allow all authenticated VPN clients to reach private subnet 1
+
+  ClientVpnAuthRule2:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    DependsOn: ClientVpnAssociation2
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      TargetNetworkCidr: !Ref PrivateSubnet2Cidr
+      AuthorizeAllGroups: true
+      Description: Allow all authenticated VPN clients to reach private subnet 2
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnetId:
+    Description: Public Subnet ID (AZ 1)
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetId'
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2 ID (AZ 2)
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  PrivateSubnetId:
+    Description: Private Subnet ID (AZ 1)
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetId'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID (AZ 2)
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  ClientVpnEndpointId:
+    Description: Client VPN Endpoint ID
+    Value: !Ref ClientVpnEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientVpnEndpointId'
+
+  S3GatewayEndpointId:
+    Description: S3 Gateway Endpoint ID (free, handles in-VPC traffic)
+    Value: !Ref S3GatewayEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-S3GatewayEndpointId'
+
+  S3InterfaceEndpointId:
+    Description: S3 Interface Endpoint ID (handles VPN client S3 traffic)
+    Value: !Ref S3InterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-S3InterfaceEndpointId'
+
+  AppSyncInterfaceEndpointId:
+    Description: AppSync Interface Endpoint ID (PrivateLink)
+    Value: !Ref AppSyncInterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncInterfaceEndpointId'
+
+  JumpboxInstanceId:
+    Description: Jumpbox EC2 Instance ID (access via SSM Session Manager)
+    Value: !Ref JumpboxInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-JumpboxInstanceId'
