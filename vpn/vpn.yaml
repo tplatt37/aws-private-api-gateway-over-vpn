@@ -471,18 +471,6 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-S3GatewayEndpointId'
 
-  S3InterfaceEndpointId:
-    Description: S3 Interface Endpoint ID (handles VPN client S3 traffic)
-    Value: !Ref S3InterfaceEndpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-S3InterfaceEndpointId'
-
-  AppSyncInterfaceEndpointId:
-    Description: AppSync Interface Endpoint ID (PrivateLink)
-    Value: !Ref AppSyncInterfaceEndpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-AppSyncInterfaceEndpointId'
-
   JumpboxInstanceId:
     Description: Jumpbox EC2 Instance ID (access via SSM Session Manager)
     Value: !Ref JumpboxInstance
